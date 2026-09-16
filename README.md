@@ -200,19 +200,6 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
 
 ---
 
-## 📜 Citation
-
-If you use or build upon this work, please cite the manuscript:
-
-```bibtex
-@article{bishowkarma2026guardedfill,
-  author    = {Aashish BishowKarma},
-  title     = {From Fixed Group Round-Robin to Guarded Adaptivity in the Dining Philosophers Problem: Formal Bounds, Native Multi-Architecture Validation, and Coordinator Removal},
-  journal   = {arXiv preprint / IEEE Transaction submission},
-  year      = {2026}
-}
-```
-
 ---
 
 ## 📄 License & Attribution
