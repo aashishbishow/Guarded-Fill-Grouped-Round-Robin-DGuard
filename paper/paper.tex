@@ -1,0 +1,472 @@
+\documentclass[10pt,journal]{IEEEtran}
+\usepackage{amsmath,amssymb,booktabs,multirow,array,graphicx,url,algorithm,algpseudocode,balance}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\usepackage{xspace}
+\graphicspath{{/mnt/data/dpp_research/}{/mnt/data/native_dpp/}{/mnt/data/revise_paper/}}
+\newcommand{\GRR}{\textsc{GRR}\xspace}
+\newcommand{\GF}{\textsc{GF--GRR}\xspace}
+\newcommand{\AMIS}{\textsc{Age--MWIS}\xspace}
+\newcommand{\RG}{\textsc{RotGreedy}\xspace}
+
+\title{From Fixed Group Round-Robin to Guarded Adaptivity in the Dining Philosophers Problem:\\Formal Bounds, Native Multi-Architecture Validation, and Coordinator Removal}
+\author{Aashish BishowKarma}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Dining Philosophers Problem (DPP) is a compact model of deadlock, starvation, fairness, and resource contention. Lee (2023) already described a group round-robin (GRR) construction that rotates $\lfloor N/2\rfloor$ nonadjacent philosophers, so fixed GRR is treated as prior art. We formalize its guarantees, use Age-MWIS as an aggressive adaptive reference, and study Guarded-Fill GRR (GF--GRR), which preserves the rotating service guard while filling otherwise idle conflict-free capacity. In a synchronous simulator, GF--GRR recovered 79.3--99.7\% of the throughput improvement of Age-MWIS over GRR across 12 core conditions while retaining the GRR service guard; stress tests reached $N=10{,}001$ and selector microbenchmarks $N=10^6$.
+
+A pre-submission audit invalidated an earlier native-thread dataset because of a recursive sleep-payload bug and a drain-path payload mismatch. A subsequent accounting audit identified two further semantic issues: the reported ``throughput'' counted requests by arrival cohort rather than completions inside the measurement interval, and the coordinator-free DGuard epoch was frozen during warmup. We corrected all four issues before freezing the native evidence. The final C++17 benchmark counts an operation only when it completes inside a 2.0 s measurement window, starts the DGuard epoch before worker release, passes $-O0$ ASan/UBSan smoke tests, and is then compiled with $-O3$. The final matrix contains 960 accepted runs on native x86$_{64}$ and ARM64 hardware: $N\in\{101,501\}$, three payloads (sleep, ledger, KV), saturated and bursty demand, five policies, and eight paired seeds.
+
+At saturated $N=501$ sleep, GF--GRR delivered 60.54k/s on x86$_{64}$ and 115.92k/s on ARM64 with p99 waits of 17.74 and 17.05 ms. DGuard was about 30--32\% slower and had p99 waits of 78.54 and 39.05 ms. Age-MWIS was statistically indistinguishable from GF--GRR in x86$_{64}$ throughput and 7.3\% faster on ARM64, but its p99 wait rose to 204.79 and 26.04 ms and its Jain fairness was lower on both platforms. For ledger and KV, coordinator removal is architecture dependent: on ARM64 DGuard increases saturated throughput by 48.5--55.2\% while worsening p99 and fairness, whereas on x86$_{64}$ its throughput is near-tied on ledger and slightly below GF--GRR on KV, with neither throughput contrast significant after Holm correction, while the p99 and fairness penalties remain significant. Thus the final multi-architecture evidence supports a workload- and platform-dependent frontier rather than a universal centralization/decentralization ranking.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Dining philosophers, deadlock, starvation, bounded waiting, round robin, independent set, conflict graph, scheduling, concurrency, fairness.
+\end{IEEEkeywords}
+
+\section{Introduction}
+Dijkstra's Dining Philosophers Problem (DPP) is one of the canonical abstractions for concurrent resource allocation. Philosophers alternate between thinking and eating, each philosopher needs the two forks shared with its immediate neighbors, and therefore adjacent philosophers cannot eat simultaneously \cite{dijkstra1971}. The problem is small enough to reason about formally but rich enough to expose the classical deadlock conditions catalogued by Coffman, Elphick, and Shoshani \cite{coffman1971}, as well as liveness, fairness, and distributed coordination issues.
+
+The literature contains deterministic ordering schemes, centralized arbiters, randomized protocols, distributed token/priority methods, self-stabilizing variants, formal-control formulations, and more recently learning-based and multi-agent evaluations \cite{hoare1978,lehmann1981,chandy1984,rana1986,adamek2017,choppella2020,ozkurt2026,hasan2026}. Consequently, a visually appealing schedule is not evidence of novelty. In particular, Lee's 2023 generalized DPP paper describes a group round-robin strategy in which $\lfloor N/2\rfloor$ nonadjacent processors execute concurrently and the group shifts right after execution \cite{lee2023}. This substantially anticipates the fixed rotating schedule that motivated the present study.
+
+Rather than rebrand prior art, this paper asks a narrower question: \emph{what can be proved and measured about rotating conflict-free groups, and can the deterministic fairness structure be retained while recovering capacity lost when scheduled philosophers are not hungry?}
+
+The paper is organized around a deliberately asymmetric three-stage progression. Fixed GRR is the formal baseline and replication target; Age-MWIS is a prior-art adaptive reference used to estimate how much performance is available when the deterministic service deadline is relaxed; GF--GRR is the primary extension. The contributions are:
+\begin{itemize}
+\item a graph-theoretic formalization of fixed GRR as a rotation of maximum independent sets of the cycle $C_N$, together with safety, capacity, and deterministic service-opportunity bounds;
+\item independent computational verification of the GRR construction for $3\le N\le500$ and exact cycle independent-set optimization against brute force;
+\item a unified adaptive reference, Age-MWIS, framed explicitly as a benchmark rather than a novel contribution;
+\item a guarded-fill extension, \GF, that never removes a hungry philosopher selected by the GRR guard but adds nonconflicting hungry philosophers from otherwise unused capacity;
+\item a proof that \GF inherits the deterministic GRR service-opportunity bound and weakly dominates GRR in instantaneous service count for any fixed hunger state;
+\item a paired statistical study quantifying the three-way throughput--latency--bound trade-off, including the fraction of Age-MWIS's adaptive throughput gain recovered by \GF;
+\item a corrected native-concurrency implementation using real POSIX threads and fork mutexes, guarded by sanitizer smoke tests and executed as a 960-run paired matrix on native x86$_{64}$ and ARM64 hardware;
+\item an explicit comparison of centralized GF--GRR, coordinator-free DGuard, Age-MWIS, a strict arrival-ordered FIFO waiter, and the ordinary $N-1$ waiter across sleep, ledger, and two-shard key/value payloads under saturated and bursty demand;
+\item a final semantically corrected native result: completion-window accounting and warmup-consistent DGuard epochs show that coordinator removal is not universally faster. DGuard loses to GF--GRR on saturated sleep on both architectures; on ledger/KV it wins strongly on ARM64 but not on x86$_{64}$, while producing larger p99 wait and lower fairness in both architectures; and
+\item a separate process-isolated replication of DGuard using process-shared synchronization, retained as descriptive evidence because it is implemented independently of the corrected thread harness.
+\end{itemize}
+
+We deliberately avoid claiming that either age-aware independent-set scheduling or guarded residual filling is globally unprecedented. Persistent-task fairness, response-time guarantees, age/priority mechanisms, and conflict-graph independent-set scheduling have substantial prior literatures \cite{awerbuch1990,barnoy1998,scholliers2014,paschalidis2015}. The claim is narrower: an explicit composition of the Lee-style GRR service guard with work-conserving residual independent-set filling, together with formal analysis and a reproducible empirical characterization under the stated model.
+
+\section{Literature Review}
+\subsection{Review method and scope}
+We conducted a targeted literature review through 15 September 2026, prioritizing primary publications, publisher/DOI records, archival manuscripts, and monographs. Query families combined \emph{dining philosophers} with \emph{deadlock}, \emph{starvation}, \emph{fairness}, \emph{round robin}, \emph{group scheduling}, \emph{independent set}, \emph{maximum-weight independent set}, \emph{self-stabilizing}, \emph{actor monitor}, \emph{feedback control}, and \emph{multi-agent coordination}. We also followed backward references from foundational papers and searched specifically for formulations that schedule multiple nonadjacent philosophers simultaneously. The goal was not a bibliometric systematic review; it was a novelty- and mechanism-oriented review sufficiently broad to identify direct prior art and the principal algorithmic families against which the present construction should be interpreted.
+
+The review produced four relevant lines of work: (i) deadlock avoidance through ordering, arbitration, or symmetry breaking; (ii) randomized and distributed progress protocols; (iii) fairness- and age-aware schedulers; and (iv) conflict-graph/independent-set scheduling. Most importantly, Lee's 2023 group round-robin construction directly anticipates the fixed rotating schedule studied here \cite{lee2023}. This changed the research question from ``is the rotation new?'' to ``what guarantees does the rotation have, where does it waste capacity, and can a conservative adaptive fill preserve its hard service guard?''
+
+\subsection{Origins, deadlock, and structured concurrency}
+Dijkstra introduced the dining-philosophers paradigm while developing hierarchical disciplines for sequential processes \cite{dijkstra1971}. The DPP directly instantiates mutual exclusion, hold-and-wait, no-preemption, and circular-wait phenomena associated with system deadlocks \cite{coffman1971}. Hoare's monitor abstraction provided a structured shared-memory synchronization framework \cite{hoare1974}, and his later Communicating Sequential Processes work used DPP-like examples to demonstrate structured communication and synchronization \cite{hoare1978}.
+
+Simple remedies break one of the deadlock-enabling conditions: impose a resource hierarchy, restrict the number of contenders, acquire resources atomically through an arbiter, or break symmetry. These approaches differ sharply in fairness and scalability. A resource hierarchy can eliminate circular wait but does not by itself guarantee starvation freedom; centralized waiter mechanisms can enforce queue fairness but introduce a coordination bottleneck.
+
+\subsection{Randomized and distributed solutions}
+Lehmann and Rabin showed the significance of randomization for symmetric, fully distributed dining philosophers, achieving eventual progress with probability one under their assumptions \cite{lehmann1981}. Duflot, Fribourg, and Picaronny later modified the randomized construction to remove a fairness assumption on the scheduler and analyzed convergence time \cite{duflot2004}. Chandy and Misra generalized resource conflict through the drinking-philosophers problem, using distributed acyclic precedence information to resolve conflicts fairly \cite{chandy1984}. Rana and Banerji studied distributed optimality in terms of communication/computation overhead and concurrency \cite{rana1986}; Vaughan examined the fairness/concurrency trade-off in centralized and decentralized forms \cite{vaughan1992}. Lynch provides a systematic treatment of deterministic and randomized dining-philosopher algorithms in distributed computation \cite{lynch1996}.
+
+\subsection{Fairness, bounded waiting, and adaptive scheduling}
+Dijkstra's later starvation-free exclusion work explicitly treats the generalized graph formulation in which adjacent vertices cannot enter their critical section together \cite{dijkstra1977}. Wedde developed a starvation-free interaction-system solution \cite{wedde1981}; Awerbuch and Saks studied polynomial response time for dynamically created, conflicting jobs in a generalized dining-philosophers setting \cite{awerbuch1990}; and Bar-Noy \emph{et al.} formalized fair repeated service for persistent dependent tasks represented by conflict graphs \cite{barnoy1998}. These works are especially relevant to the present emphasis on response regularity rather than deadlock freedom alone. Self-stabilizing DPP algorithms have also been evaluated on latency, throughput, and fault tolerance \cite{adamek2017}, while modern randomized locking work studies strong time/fairness guarantees under adversarial delay \cite{bendavid2025}. Parallel Actor Monitors provide a relevant precedent for age-ordered reservation-aware scheduling in a dining-philosophers example \cite{scholliers2014}.
+
+Independent-set scheduling is standard outside DPP as well. Wireless-network schedulers routinely construct a conflict graph and choose a maximum-weight independent set (MWIS), often using queue backlog or related urgency measures to trade throughput and delay \cite{paschalidis2015}. This broader literature is why Age-MWIS is used here as an adaptive reference rather than claimed as a contribution. It also motivates the central design question of the merged study: how much of a work-conserving independent-set scheduler's gain can be recovered while retaining a deterministic GRR service guard?
+
+\subsection{Recent reformulations and learning-based studies}
+Choppella \emph{et al.} recast generalized dining philosophers as feedback control, separating architecture from algorithmic details \cite{choppella2020}. In 2026, {\"O}zkurt \emph{et al.} compared reinforcement-learning policies with classical methods at up to 160 philosophers \cite{ozkurt2026}. DPBench used DPP as a simultaneous-coordination benchmark for LLM agents and reported deadlock rates above 95\% in some simultaneous settings, emphasizing the value of explicit external coordination \cite{hasan2026}.
+
+\subsection{Direct prior art for rotating groups}
+Lee's 2023 method is the closest prior art to the fixed schedule studied here: form a group of $\lfloor N/2\rfloor$ nonadjacent processors, execute them simultaneously, and shift the group right in a round-robin manner \cite{lee2023}. The present paper therefore treats fixed GRR as prior art and a replication target. The research gap we study is dynamic utilization: a fixed group can contain philosophers that are not currently hungry, leaving conflict-free service opportunities unused.
+
+\begin{table*}[t]
+\centering
+\caption{Positioning relative to representative Dining Philosophers and conflict-scheduling literature}
+\label{tab:lit}
+\footnotesize
+\begin{tabular}{p{2.4cm}p{2.5cm}p{2.4cm}p{2.3cm}p{5.0cm}}
+\toprule
+Work & Coordination model & Main objective & Fairness/progress mechanism & Relation to this paper\\
+\midrule
+Dijkstra (1971) \cite{dijkstra1971} & Shared-resource processes & Deadlock-safe ordering & Hierarchical resource discipline & Foundational DPP/resource-ordering context; not a round scheduler.\\
+Lehmann--Rabin (1981) \cite{lehmann1981} & Symmetric distributed & Probabilistic progress & Randomized choices & Solves symmetry without centralized schedules; different assumptions.\\
+Chandy--Misra (1984) \cite{chandy1984} & Distributed conflict graph & Fair resource conflict resolution & Dynamic precedence / resource state & General graph-oriented distributed solution; richer message semantics than our round model.\\
+Duflot et al. (2004) \cite{duflot2004} & Randomized distributed & Progress without scheduler fairness assumption & Probabilistic convergence & Addresses adversarial scheduling assumptions absent from our centralized model.\\
+Scholliers et al. (2014) \cite{scholliers2014} & Actor monitor / scheduler & Parallelism with controlled conflicts & Age/order and reservation mechanisms & Important precedent for age-aware reservation-style coordination.\\
+Paschalidis et al. (2015) \cite{paschalidis2015} & Conflict-graph scheduling & Throughput / delay & MWIS with queue-related weights & Establishes independent-set scheduling as a general scheduling pattern.\\
+Lee (2023) \cite{lee2023} & Centralized group round robin & Deadlock prevention with concurrency & Rotate $\lfloor N/2\rfloor$ nonadjacent processors & Direct prior art for fixed GRR; replicated and formalized here.\\
+Ben-David--Blelloch (2025) \cite{bendavid2025} & Concurrent locks & Fast fair wait-free locking & Randomization with fairness guarantees & Modern fairness benchmark under different asynchronous lock semantics.\\
+Hasan--BusiReddyGari (2026) \cite{hasan2026} & LLM multi-agent contention & Simultaneous coordination & Benchmark, not scheduler & Motivates external conflict-set coordination as a contemporary application.\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Model and Definitions}
+Let $C_N=(V,E)$ be the cycle graph with $V=\{0,\dots,N-1\}$ and $E=\{(i,(i+1)\bmod N)\}$. Vertex $i$ is philosopher $P_i$. A set $S\subseteq V$ is feasible in a round iff it is an independent set of $C_N$; then no fork is shared by two simultaneous eaters. The maximum possible number of simultaneous eaters is
+\begin{equation}
+\alpha(C_N)=\left\lfloor\frac{N}{2}\right\rfloor.
+\end{equation}
+
+Time is discretized into rounds. A philosopher is either thinking or has one pending hunger request. Eating takes one round. If a request is served in its arrival round its waiting age is zero; otherwise age increments by one after each unserved round. This synchronous centralized abstraction intentionally isolates scheduling behavior from OS-thread timing and message-passing effects.
+
+For stochastic experiments, a non-pending philosopher receives a Bernoulli hunger opportunity with probability $p_i$ each round. We evaluate uniform $p_i=p$ and hotspot demand, where approximately 10\% of vertices receive four times the mean rate (capped at 0.95) and the remaining rate is adjusted to preserve the requested mean.
+
+\section{Fixed Group Round-Robin}
+Let $m=\lfloor N/2\rfloor$. Define the GRR set in round $t$ as
+\begin{equation}
+S_t=\{(t+2k)\bmod N: k=0,\dots,m-1\}.
+\end{equation}
+For even $N$, this alternates the two parity classes. For odd $N$, the pairwise-spaced set rotates around the odd cycle.
+
+\textbf{Proposition 1 (Safety and maximal concurrency).} For every $N\ge3$ and every round $t$, $S_t$ is an independent set of $C_N$ and $|S_t|=\lfloor N/2\rfloor=\alpha(C_N)$.
+
+\emph{Proof.} Write $m=\lfloor N/2\rfloor$. Distinct consecutive elements of the construction differ by two modulo $N$, so they cannot be adjacent. For even $N=2m$, the selected vertices form one parity class and the cyclic wrap-around also has distance two. For odd $N=2m+1$, the selected sequence ends at $t+2(m-1)$; the shorter cyclic distance between this vertex and $t$ is three, not one. Hence $S_t$ is independent. Its cardinality is $m$. Any independent set on a cycle uses at most one endpoint of each of the $m$ disjoint edges obtained by deleting one vertex (odd case) or pairing consecutive vertices (even case), so $\alpha(C_N)\le m$. Therefore $|S_t|=\alpha(C_N)=m$. \hfill$\square$
+
+\textbf{Proposition 2 (Service-opportunity gap).} Under the rotation above, the gap between consecutive GRR opportunities for a philosopher is exactly two rounds when $N$ is even, and belongs to $\{2,3\}$ when $N$ is odd.
+
+\emph{Proof.} Philosopher $i$ is scheduled in round $t$ exactly when $i\equiv t+2k\pmod N$ for some $k\in\{0,\ldots,m-1\}$. For even $N=2m$, $S_{t+2}=S_t$, while $S_{t+1}$ is the complementary parity class; thus each vertex occurs every two rounds. For odd $N=2m+1$, $S_{t+2}$ is $S_t$ shifted two positions, so most vertices reappear after two rounds. Because $m$ selected positions cannot tile an odd cycle with alternating selected/unselected vertices, one unselected pair occurs in each rotated pattern; crossing this unique two-vertex gap delays the next opportunity by one additional round. Hence the only cyclic inter-opportunity gaps are two and three. \hfill$\square$
+
+The construction was exhaustively checked in software for every $3\le N\le500$: no adjacency/cardinality failures occurred, and the maximum observed inter-opportunity gap was three.
+
+\textbf{Corollary 1 (Bounded waiting in the round model).} If a hunger request remains pending until served, fixed GRR offers service after at most one intervening round for even $N$ and at most two intervening rounds for odd $N$. This bound assumes unit service time and synchronous round boundaries; it is a scheduler bound, not a claim about arbitrary asynchronous implementations.
+
+The limitation is immediate: GRR reserves positions without inspecting current demand. If a scheduled philosopher is not hungry, the slot remains unused even when another nonadjacent hungry philosopher could eat.
+
+\section{Adaptive Reference: Age-MWIS}
+Fixed GRR is demand-oblivious: it can leave capacity unused when a scheduled philosopher is not hungry. To separate the value of adaptivity from the value of a deterministic deadline, we use an age-aware maximum-weight independent-set policy as a fully adaptive reference. Let $H_t$ be the hungry set and $a_i(t)$ the current waiting age of hungry philosopher $i$. Assign each eligible vertex the lexicographic weight
+\begin{equation}
+q_i(t)=(1,a_i(t)),
+\end{equation}
+and choose
+\begin{equation}
+A_t\in\arg\max_{A\in\mathcal{I}(C_N),\,A\subseteq H_t}^{\rm lex}
+\left(|A|,\sum_{i\in A}a_i(t)\right).
+\end{equation}
+Thus Age-MWIS first maximizes the number served in the current round and, among maximum-cardinality choices, prefers the greatest accumulated waiting age. On a cycle this can be solved exactly in $O(N)$ time by two path dynamic programs. The policy is work-conserving with respect to the current hunger state, but it reserves no future deadline for any individual request. Conflict-graph MWIS scheduling is established prior art \cite{barnoy1998,paschalidis2015}; Age-MWIS is therefore a benchmark approximating an aggressive adaptive ceiling in this round model, not a co-equal algorithmic contribution.
+
+\section{Primary Extension: Guarded-Fill GRR}
+\GF preserves GRR as a hard fairness guard and uses adaptive selection only for residual capacity. Let $H_t$ denote the set of hungry philosophers. The mandatory set is
+\begin{equation}
+M_t=H_t\cap S_t.
+\end{equation}
+Every vertex in $M_t$ is served. Remove $M_t$, its neighbors, and all non-hungry vertices from consideration. On the remaining induced graph, choose an independent set that lexicographically maximizes (i) number of additionally served requests and then (ii) total waiting age. Because the residual graph is a subgraph of a cycle (hence a union of paths, or a cycle if $M_t=\emptyset$), this optimization is solvable by dynamic programming in $O(N)$ time.
+
+\begin{algorithm}[t]
+\caption{Guarded-Fill GRR for round $t$}
+\begin{algorithmic}[1]
+\State $S_t\gets\{(t+2k)\bmod N\}_{k=0}^{\lfloor N/2\rfloor-1}$
+\State $M_t\gets H_t\cap S_t$ \Comment{mandatory GRR guard}
+\State block $M_t$ and every neighbor of $M_t$
+\State $R_t\gets$ hungry, unblocked vertices
+\State $A_t\gets$ lexicographic max-cardinality/age independent set of $R_t$
+\State \Return $M_t\cup A_t$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Exact residual optimization on the cycle}
+For an eligible hungry vertex $i$ with waiting age $a_i$, assign the lexicographic value $q_i=(1,a_i)$; an ineligible vertex contributes no selectable value. On a path with vertices $1,\ldots,L$, let $D_j$ denote the best pair (served-count, summed-age) on the prefix through $j$. With lexicographic maximum $\max_{\rm lex}$,
+\begin{equation}
+D_j=\max_{\rm lex}\left(D_{j-1},\;D_{j-2}+q_j\right),
+\end{equation}
+whenever $j$ is eligible, and $D_j=D_{j-1}$ otherwise. A cycle is solved by taking the better of two cases: exclude vertex 0, or include vertex 0 and exclude its two neighbors. Backtracking recovers the set. This is $O(N)$ time and $O(N)$ auxiliary memory in the reference implementation (reducible to $O(1)$ value memory if reconstruction is not required). We verified the returned lexicographic objective against brute-force enumeration on 1,500 random cycles with $3\le N\le12$ and observed zero mismatches.
+
+\textbf{Proposition 3 (Safety).} \GF never schedules adjacent philosophers.
+
+\emph{Reason.} $M_t$ is independent by Proposition 1; all neighbors of $M_t$ are excluded from $A_t$; and $A_t$ is itself independent. \hfill$\square$
+
+\textbf{Proposition 4 (Inherited waiting bound).} Every pending request that would be served by fixed GRR at round $t$ is also served by \GF at round $t$. Therefore \GF inherits Corollary 1's deterministic opportunity/wait bound.
+
+\textbf{Proposition 5 (Per-state dominance over GRR).} For any fixed $H_t$, $|\GF(H_t,t)|\ge|H_t\cap S_t|$. Equality holds only when no additional feasible hungry vertex exists or the residual optimum is empty.
+
+Proposition 5 is deliberately local: because different policies create different future states, it does not by itself prove higher long-run throughput. That question is empirical under the stochastic model.
+
+\section{Algorithmic Progression and Secondary Comparators}
+The central comparison is the progression 
+\begin{equation}
+\begin{aligned}
+\text{fixed GRR} &\longrightarrow \text{Age-MWIS reference}\\
+                 &\longrightarrow \text{GF--GRR hybrid}.
+\end{aligned}
+\end{equation}
+GRR supplies the deterministic bound; Age-MWIS shows what a fully adaptive exact cycle scheduler can gain when that bound is not enforced; GF--GRR asks how much of that gain can be retained while preserving the guard. Two secondary comparators provide additional context:
+\begin{enumerate}
+\item \textbf{RotatingGreedy}: scan vertices from a rotating start and greedily accept hungry nonadjacent vertices. It is $O(N)$ and work-conserving in many states, but it has no explicit age objective or deterministic request deadline.
+\item \textbf{SingleWaiter}: serve only the oldest pending request, representing a strongly serialized fair baseline.
+\end{enumerate}
+
+\section{Experimental Methodology}
+\subsection{Core statistical design}
+The core benchmark uses $N\in\{101,1001\}$, $p\in\{0.05,0.20,0.40\}$, uniform and hotspot workloads, five algorithms, and 12 paired random seeds per condition. Each run contains 300 warm-up rounds followed by 3000 measured rounds. This is $2\times3\times2\times5\times12=720$ algorithm runs. Each algorithm receives the same seed within a condition; one random variate is generated for every philosopher in every round so paired streams are structurally aligned even when policy states diverge.
+
+The primary planned comparison is GuardedFill versus GRR on throughput and mean wait (24 tests). Two explicitly secondary contrast families support the merged narrative: Age-MWIS versus GRR on throughput and mean wait (24 tests), and GuardedFill versus Age-MWIS on throughput and maximum observed wait (24 tests). Within each family we apply two-sided Wilcoxon signed-rank tests with Holm correction and report paired mean differences; 95\% paired $t$ confidence intervals are retained as effect-size summaries, not as the sole significance criterion. All 24 primary GuardedFill--GRR tests and all 24 Age-MWIS--GRR reference tests remain significant after Holm correction ($p_{\rm Holm}=0.011719$ in each condition). For GuardedFill versus Age-MWIS, 20 of 24 contrasts remain significant after correction; the four nonsignificant contrasts occur at the lowest uniform demand ($p=0.05$), where the two adaptive policies are nearly indistinguishable in throughput and observed maximum wait.
+
+\subsection{Additional regimes}
+Canonical $N=5$ experiments use 30 replications and 10,000 measured rounds for intuition at the original problem size. Stress tests use $N=10{,}001$, $p\in\{0.2,0.4\}$, both workload types, five paired replications, and 1200 measured rounds after 200 warm-up rounds. Selector microbenchmarks materialize schedules for $N=10^3,10^4,10^5,10^6$.
+
+\subsection{Metrics}
+We record completed meals/round (throughput), normalized utilization relative to $\lfloor N/2\rfloor$, mean waiting age, 95th/99th percentile wait, maximum observed wait, Jain's fairness index over per-philosopher completion counts, and implementation time. Maximum observed waiting in a finite stochastic run is not a proof of starvation freedom; the formal bound for GRR/GuardedFill comes from Propositions 2 and 4.
+
+\subsection{Correctness and implementation verification}
+The GRR construction was checked for adjacency, cardinality, and opportunity gaps for $3\le N\le500$. The exact cycle Age-MWIS dynamic program was cross-checked against brute-force enumeration on 1,500 random instances for $3\le N\le12$, optimizing the lexicographic pair (cardinality, total waiting age); there were zero mismatches. Code was implemented in Python/NumPy with Numba JIT. Runtime numbers are machine- and implementation-specific and are used only to assess scaling trends.
+
+\subsection{Final native multi-architecture validation}
+The native benchmark is a C++17/POSIX-thread implementation with one worker thread per philosopher, real mutex-protected forks, a central scheduler for GF--GRR and Age-MWIS, a coordinator-free DGuard policy, an explicit arrival-ordered head-of-line FIFO waiter, and the ordinary $N-1$ room-semaphore waiter. Three critical-section payloads are used. The \emph{sleep} payload samples a bounded log-normal-like duration clipped to 0.4--2.6 ms and sleeps while holding the two resource mutexes. The \emph{ledger} payload performs variable arithmetic plus a double-entry transfer across the locked shards; the global balance sum is checked after each run. The \emph{KV} payload performs variable-count hash-like mutations over two 64-entry shard arrays. In the saturated workload a worker immediately requests another critical section after completion; in the bursty workload thinking intervals are 0.6--5.0 ms with a 15\% probability of a longer pause. Each worker has at most one outstanding request.
+
+The final native evidence was produced only after two rounds of pre-submission audit. The first audit corrected a recursive control-flow error in the sleep payload and replaced the central final-drain sleep with the selected application payload. The second audit corrected measurement semantics. First, an operation is now counted only if its \emph{completion timestamp}, taken after payload execution and resource release, lies in $[t_{\rm start},t_{\rm end})$. Thus completions/s, Jain fairness, and zero-service counts refer to service actually completed during the measurement interval; requests that arrive before the window may count if they complete inside it, and requests that complete after $t_{\rm end}$ do not. Second, DGuard uses a dedicated monotonic \texttt{epoch\_origin\_ns} established immediately before worker release, so the rotating epoch evolves during warmup instead of remaining at phase zero until measurement begins. The post-stop drain remains only for clean shutdown and cannot contaminate measured counts because completions after $t_{\rm end}$ are excluded.
+
+The final matrix uses $N\in\{101,501\}$, payloads \{sleep, ledger, KV\}, saturated and bursty demand, eight paired seeds, and five policies \{GF--GRR, DGuard, FIFO waiter, ordinary waiter, Age-MWIS\}. Each run measures 2.0 s after warmup, with a 200 $\mu$s scheduler tick, up to 120 $\mu$s scheduler jitter, up to 80 $\mu$s worker-dispatch jitter, and a 1.2 ms DGuard epoch. This yields
+\begin{align*}
+&2\;\text{architectures}\times 2N\times 3\;\text{payloads}\times 2\;\text{workloads}\\
+&\qquad\times 5\;\text{policies}\times 8\;\text{seeds}=960.
+\end{align*}
+accepted runs.
+
+The x86$_{64}$ runner exposed two logical CPUs of an AMD EPYC 7763 host; the ARM64 runner exposed two ARM Neoverse-N2 cores. Both used Ubuntu 24.04 GitHub-hosted runner images, Linux 6.17 Azure kernels, and GCC 13.3.0. The ARM64 job reported native \texttt{aarch64}; it was not cross-compiled or emulated. Because the machines differ in microarchitecture and virtualization environment, absolute x86$_{64}$--ARM64 throughput differences are descriptive rather than an ISA comparison.
+
+The accepted source was reconstructed from the previously audited base inside each runner, passed explicit semantic source checks, compiled at $-O0$ with AddressSanitizer and UndefinedBehaviorSanitizer for a sleep-payload smoke test, and then compiled with $-O3$. Both runner artifacts contain byte-identical source with SHA-256 \texttt{62e91da4\allowbreak{}636dc597\allowbreak{}d43e64a6\allowbreak{}f9a81b5b\allowbreak{}c2429f27\allowbreak{}96e49783\allowbreak{}1047779c\allowbreak{}3476c336}.
+
+We record completions/s, request-to-lock-acquisition mean/p95/p99/max wait, Jain fairness over per-worker completions, minimum/maximum completions, and the number of workers with zero measured completions. Zero-service counts are finite-window diagnostics, not proofs of starvation. For paired contrasts, two-sided exact Wilcoxon signed-rank tests are Holm-corrected within each three-metric family (throughput, p99, Jain) for a fixed architecture, payload, workload, and policy contrast.
+
+\section{Results}
+\subsection{Canonical $N=5$ behavior}
+At $N=5$, fixed GRR preserves its hard waiting bound but can leave substantial capacity unused under skew. At $p=0.20$ hotspot demand, GRR achieved 0.583 meals/round with mean wait 1.150, while GuardedFill achieved 0.943 meals/round with mean wait 0.120; both had maximum observed wait 2. At $p=0.40$ uniform demand, throughput increased from 1.424 to 1.620 meals/round while maximum observed wait again remained 2.
+
+The fairness index requires careful interpretation under hotspot demand: equal service counts are not necessarily desirable when demand itself is unequal. Thus hotspot Jain values mainly describe equality of completions, not demand-normalized justice.
+
+\subsection{Core throughput and waiting}
+Figure~\ref{fig:thr} shows the uniform $N=1001$ throughput curves. The three-stage progression is visible directly. At $p=0.20$, GRR completed 180.04 meals/round, Age-MWIS 191.31, and GuardedFill 190.66. Relative to the full GRR-to-Age-MWIS gain, GuardedFill recovered 94.3\% while retaining the GRR maximum observed wait of 2 rounds. RotatingGreedy reached 191.33, confirming that the remaining throughput headroom above GuardedFill is small in this condition.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_throughput_uniform.pdf}
+\caption{Throughput at $N=1001$ under uniform demand. Adaptive schedulers recover slots that fixed GRR leaves idle.}
+\label{fig:thr}
+\end{figure}
+
+Across uniform $N=1001$ workloads, GuardedFill throughput gains over GRR were 2.30\%, 5.90\%, and 4.08\% for $p=0.05,0.20,0.40$ respectively; corresponding mean-wait reductions were 89.5\%, 55.5\%, and 19.5\%. Under hotspot demand the throughput gains were 3.23\%, 3.52\%, and 4.21\%, with mean-wait reductions of 77.7\%, 43.6\%, and 22.1\%. More importantly for the merged paper, GF--GRR recovered between 79.3\% and 99.7\% of the Age-MWIS throughput gain over GRR across all 12 core conditions. Its absolute throughput deficit to Age-MWIS at $N=1001$ was at most about 1.01\%, while its maximum observed wait remained 2 rounds in every condition.
+
+\begin{table*}[t]
+\centering
+\caption{Three-way $N=1001$ trade-off. Values are means over 12 paired replications. ``Recovery'' is $(T_{GF}-T_{GRR})/(T_{Age}-T_{GRR})$: the fraction of the Age-MWIS throughput improvement over GRR recovered by GF--GRR. Max-wait columns report the largest observed wait across the 12 runs.}
+\label{tab:primary}
+\footnotesize
+\begin{tabular}{llrrrrrrrr}
+\toprule
+Workload & $p$ & GRR thr. & GF thr. & Age thr. & Recovery & GRR max & GF max & Age max\\
+\midrule
+Uniform & .05 & 48.806 & 49.927 & 49.930 & 99.7\% & 2 & 2 & 2\\
+Uniform & .20 & 180.042 & 190.663 & 191.307 & 94.3\% & 2 & 2 & 4\\
+Uniform & .40 & 320.165 & 333.239 & 336.628 & 79.4\% & 2 & 2 & 6\\
+Hotspot & .05 & 47.586 & 49.124 & 49.190 & 95.9\% & 2 & 2 & 4\\
+Hotspot & .20 & 160.119 & 165.754 & 165.837 & 98.5\% & 2 & 2 & 5\\
+Hotspot & .40 & 303.330 & 316.107 & 318.575 & 83.8\% & 2 & 2 & 5\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+At $N=1001,p=0.20$ hotspot demand, GRR throughput was 160.12 and GuardedFill was 165.75 meals/round (paired 95\% CI for the difference: 5.602--5.668). Mean wait fell from 0.627 to 0.354 rounds (difference CI: $-0.274$ to $-0.273$). Under uniform demand at the same $p$, the throughput difference was 10.621 meals/round (95\% CI 10.597--10.645), and mean wait fell from 0.557 to 0.248.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_wait_uniform.pdf}
+\caption{Mean waiting age at $N=1001$ under uniform demand. Fixed GRR pays a utilization/latency penalty for deterministic reservation; GuardedFill recovers much of it without relaxing the GRR guard.}
+\label{fig:wait}
+\end{figure}
+
+\subsection{Tail waiting: hard guard versus unconstrained adaptivity}
+The distinction between GuardedFill and the fully adaptive methods is most visible in tail waiting. In the core runs, GuardedFill and GRR never exceeded a wait of two rounds for odd $N$, exactly as predicted by the formal guard. Age-MWIS reached maxima between roughly 2 and 7 rounds depending on condition, while RotatingGreedy produced substantially longer tails under skew (up to 25 rounds in the core benchmark).
+
+At $N=10{,}001,p=0.4$ hotspot demand, maximum observed waits were 2 for GRR, 2 for GuardedFill, 6 for Age-MWIS, and 26 for RotatingGreedy (Fig.~\ref{fig:tail}). Throughput in the same condition was 3032.18, 3158.72, 3182.76, and 3184.03 meals/round respectively. Thus GuardedFill gave up about 0.8\% throughput relative to the Age-MWIS adaptive reference but retained the deterministic GRR guard.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_tail_stress.pdf}
+\caption{Maximum observed waiting at $N=10{,}001$, hotspot $p=0.4$. GuardedFill preserves the fixed GRR tail bound in this model, unlike unconstrained adaptive comparators.}
+\label{fig:tail}
+\end{figure}
+
+\subsection{Large-$N$ stress results}
+Table~\ref{tab:stress} summarizes selected $N=10{,}001$ runs. Under uniform $p=0.2$, GuardedFill improved throughput from 1799.74 to 1905.07 meals/round (5.85\%) and reduced mean wait from 0.556 to 0.248, with the same maximum observed wait of 2. Age-MWIS achieved 1911.61 and RotatingGreedy 1911.84 but with maxima of 5 and 9 rounds respectively.
+
+\begin{table}[t]
+\centering
+\caption{Selected stress results at $N=10{,}001$}
+\label{tab:stress}
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{llrrr}
+\toprule
+Workload & Algorithm & Throughput & Mean wait & Max wait\\
+\midrule
+Uniform $p=.2$ & GRR & 1799.74 & 0.556 & 2\\
+ & GuardedFill & 1905.07 & 0.248 & 2\\
+ & Age-MWIS & 1911.61 & 0.230 & 5\\
+ & RotGreedy & 1911.84 & 0.229 & 9\\
+\midrule
+Hotspot $p=.4$ & GRR & 3032.18 & 0.660 & 2\\
+ & GuardedFill & 3158.72 & 0.515 & 2\\
+ & Age-MWIS & 3182.76 & 0.489 & 6\\
+ & RotGreedy & 3184.03 & 0.487 & 26\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Capacity--latency trade-off}
+The adaptive policies expose a meaningful distinction between \emph{work conservation} and \emph{bounded service}. Age-MWIS and RotatingGreedy use current demand more aggressively and usually obtain the highest throughput, but neither reserves a deadline for any particular request. GuardedFill instead constrains adaptation by forcing the base GRR obligations first. At $N=10{,}001,p=0.4$ hotspot demand, for example, GuardedFill delivered 3158.72 meals/round versus 3182.76 for Age-MWIS (a 0.76\% gap) while reducing the observed maximum wait from 6 to 2. RotatingGreedy reached 3184.03 but its maximum observed wait rose to 26. The result is not a universal dominance claim; it quantifies a design choice between a hard deterministic guard and a small amount of additional opportunistic capacity.
+
+\subsection{Selector scaling}
+Materialized selector timing was consistent with linear growth in $N$ in the tested implementation. At $N=10^6$, median per-call times recorded in the artifact were approximately 1.05 ms for GRR schedule materialization, 5.67 ms for RotatingGreedy, and 6.43 ms for Age-MWIS. These figures are not portable performance claims: Numba compilation, CPU microarchitecture, memory bandwidth, and representation choices matter. GF--GRR additionally invokes residual optimization only after constructing its mandatory guard, so its end-to-end simulation cost is reported separately in the raw run records rather than inferred from this selector-only figure. In a production implementation, fixed GRR can also be represented implicitly rather than materializing a million-element mask.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_scaling.pdf}
+\caption{Selector scaling in the experimental implementation. All shown methods are linear-time on the cycle; fixed GRR has the smallest constant factor.}
+\label{fig:scaling}
+\end{figure}
+
+
+\section{Final Semantically Corrected Native Multi-Architecture Validation}
+\subsection{Saturated sleep: guarded admission controls tails}
+Table~\ref{tab:finalsleep} summarizes the final saturated sleep results at $N=501$. The 2.0 s completion-window accounting removes the earlier artifact in which requests that arrived inside a short window could complete long after the window and still count toward throughput/fairness. Under the final semantics, GF--GRR and Age-MWIS both provide service to every worker on every saturated $N=501$ sleep run; DGuard does as well. The ordinary waiter remains highly concentrated under saturation.
+
+On x86$_{64}$, GF--GRR averaged 60,539 completions/s, essentially identical to Age-MWIS at 60,941/s, but p99 wait was 17.74 ms versus 204.79 ms and Jain fairness was 0.979 versus 0.954. The GF--GRR/Age-MWIS throughput contrast is not significant after Holm correction ($p_{\rm Holm}=0.742$), whereas p99 and Jain are ($p_{\rm Holm}=0.0234$). DGuard was slower at 42,382/s and had 78.54 ms p99; GF--GRR's throughput and p99 advantages both survive Holm correction ($p_{\rm Holm}=0.0234$), while their Jain difference does not ($p_{\rm Holm}=0.547$).
+
+On ARM64, Age-MWIS obtains the highest sleep throughput (124,348/s), 7.3\% above GF--GRR (115,919/s), but GF--GRR reduces p99 wait from 26.04 to 17.05 ms and raises Jain fairness from 0.831 to 0.998. DGuard is both slower than GF--GRR (78,713/s) and higher-tailed (39.05 ms p99). All three GF--GRR/Age-MWIS and GF--GRR/DGuard metrics survive their respective three-test Holm families on ARM64 ($p_{\rm Holm}=0.0234$). The important cross-platform observation is therefore not identical throughput rank but the repeated tail-regularity benefit of GF--GRR under the timing-dominated saturated workload.
+
+\begin{table*}[t]
+\centering
+\caption{Final semantically corrected saturated sleep results at $N=501$ (means over eight paired seeds per architecture; 2.0 s completion window). ``Zero'' is the number of workers with no completion inside the measurement interval.}
+\label{tab:finalsleep}
+\footnotesize
+\begin{tabular}{llrrrr}
+\toprule
+Arch. & Policy & Throughput/s & p99 ms & Jain & Zero\\
+\midrule
+x86$_{64}$ & GF--GRR & 60538.7 & 17.735 & 0.979 & 0.0\\
+ & DGuard & 42382.1 & 78.537 & 0.962 & 0.0\\
+ & Age-MWIS & 60940.7 & 204.791 & 0.954 & 0.0\\
+ & FIFO waiter & 1145.3 & 549.198 & 0.982 & 0.0\\
+ & $N-1$ waiter & 593.6 & 2016.252 & 0.103 & 218.3\\
+\midrule
+ARM64 & GF--GRR & 115919.2 & 17.046 & 0.998 & 0.0\\
+ & DGuard & 78712.8 & 39.053 & 0.989 & 0.0\\
+ & Age-MWIS & 124348.3 & 26.043 & 0.831 & 0.0\\
+ & FIFO waiter & 1052.8 & 710.125 & 0.971 & 0.0\\
+ & $N-1$ waiter & 588.0 & 1620.006 & 0.034 & 389.3\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_final_semantic_p99.pdf}
+\caption{Final saturated $N=501$ p99 request-to-lock wait for GF--GRR, DGuard, and Age-MWIS. The qualitative GF--GRR tail advantage persists on both native architectures.}
+\label{fig:finalp99}
+\end{figure}
+
+\subsection{Ledger and KV: coordinator-removal throughput is architecture dependent}
+Table~\ref{tab:finalapps} shows a different operating point for state-mutating critical sections, but the throughput effect of coordinator removal does not replicate uniformly across hardware. On x86$_{64}$, ledger is essentially tied: DGuard averages 166,603/s versus 166,039/s for GF--GRR (+0.34\%), and the paired throughput contrast is not significant after Holm correction ($p_{\rm Holm}=0.250$). For KV, GF--GRR is higher at 133,129/s versus 129,002/s for DGuard; that throughput contrast is also not significant ($p_{\rm Holm}=0.078$). On ARM64, by contrast, DGuard rises from 177,665 to 275,775/s (+55.2\%) for ledger and from 176,109 to 261,439/s (+48.5\%) for KV; both throughput differences survive Holm correction ($p_{\rm Holm}=0.0234$).
+
+The regularity price is much more consistent than the throughput effect. DGuard p99 wait is larger in all four cases: 13.93 versus 5.95 ms (x86 ledger), 18.99 versus 7.25 ms (x86 KV), 9.13 versus 5.50 ms (ARM ledger), and 9.15 versus 5.55 ms (ARM KV). All four p99 differences survive Holm correction ($p_{\rm Holm}=0.0234$). Jain fairness likewise falls from 0.997/0.997 under GF--GRR to 0.963/0.946 on x86$_{64}$ and from 0.997/0.997 to 0.884/0.910 on ARM64; all four fairness contrasts survive correction. Every accepted ledger run preserves the double-entry conservation invariant.
+
+Age-MWIS sits close to GF--GRR on these application-shaped payloads. GF--GRR has lower p99 than Age-MWIS in all four cases, and every p99 contrast survives Holm correction. Their throughput differences do not survive correction in any of the four architecture/payload comparisons, and the Jain differences are very small. This reinforces that the main distinction between GF--GRR and Age-MWIS in these payloads is tail control rather than a universal throughput ranking.
+
+\begin{table*}[t]
+\centering
+\caption{Final saturated ledger/KV results at $N=501$ (means over eight paired seeds per architecture; 2.0 s completion window).}
+\label{tab:finalapps}
+\footnotesize
+\begin{tabular}{lllrrr}
+\toprule
+Arch. & App & Policy & Throughput/s & p99 ms & Jain\\
+\midrule
+x86$_{64}$ & Ledger & GF--GRR & 166039.2 & 5.951 & 0.997\\
+ & & DGuard & 166602.7 & 13.932 & 0.963\\
+ & & Age-MWIS & 164640.6 & 7.673 & 0.997\\
+ & KV & GF--GRR & 133129.2 & 7.249 & 0.997\\
+ & & DGuard & 129002.1 & 18.985 & 0.946\\
+ & & Age-MWIS & 132802.7 & 9.345 & 0.997\\
+\midrule
+ARM64 & Ledger & GF--GRR & 177665.4 & 5.497 & 0.997\\
+ & & DGuard & 275775.4 & 9.130 & 0.884\\
+ & & Age-MWIS & 173640.6 & 7.076 & 0.997\\
+ & KV & GF--GRR & 176108.9 & 5.547 & 0.997\\
+ & & DGuard & 261439.3 & 9.154 & 0.910\\
+ & & Age-MWIS & 174109.7 & 7.263 & 0.997\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig_final_semantic_throughput.pdf}
+\caption{Final saturated $N=501$ throughput. DGuard loses on the timing-dominated sleep workload on both architectures; its ledger/KV throughput advantage is strong on ARM64 but does not replicate on x86$_{64}$. Absolute x86$_{64}$--ARM64 differences are not interpreted as ISA effects.}
+\label{fig:finalthr}
+\end{figure}
+
+\subsection{Bursty demand: coordination overhead dominates more often}
+Under bursty demand all five policies have far more regular completion distributions, and zero-service counts disappear at $N=501$. On ARM64 sleep, GF--GRR, Age-MWIS, and the ordinary waiter cluster near 77k/s, while DGuard is slightly slower; on x86$_{64}$ sleep the ordinary waiter is fastest at 71,846/s, compared with 52,739/s for GF--GRR. For ledger/KV, DGuard and the ordinary waiter are fastest on both architectures. For example, x86$_{64}$ ledger reaches 123,150/s for DGuard and 123,538/s for the waiter versus 76,216/s for GF--GRR; ARM64 ledger reaches roughly 124.6--124.7k/s for DGuard/waiter versus 118.3k/s for GF--GRR. Jain fairness is approximately 0.99--1.00 throughout these bursty $N=501$ conditions. Thus, when conflicts are intermittent, the global selection pass can cost more than the regularity it provides.
+
+\subsection{What the final native study establishes}
+The final measurement semantics substantially improve interpretability. Throughput is now literally completions per second inside the measurement interval, and fairness/zero-service counts are based on those same in-window completions. Long post-window drains cannot inflate measured throughput or produce apparent multi-second p99 values from a nominal 180 ms cohort. DGuard also begins rotating before warmup, eliminating the previous initialization asymmetry.
+
+With those corrections, the qualitative result is narrower but stronger. GF--GRR is not a universal throughput winner. Its most reproducible native advantage is controlled p99/tail behavior under sustained contention, especially on the timing-dominated sleep payload. DGuard can be markedly faster for compute/memory payloads on ARM64, but that throughput gain does not reproduce on x86$_{64}$; what does reproduce is DGuard's larger p99 and lower Jain fairness relative to GF--GRR for saturated ledger/KV. Age-MWIS can match or exceed GF--GRR throughput, yet GF--GRR retains lower p99 in every saturated $N=501$ GF--GRR/Age-MWIS comparison. The systems problem is therefore a workload- and platform-dependent throughput--tail--fairness frontier rather than a single winning policy.
+
+\section{Coordinator Removal and Process-Isolated Replication}
+DGuard removes the $O(N)$ central selector. Each worker derives the current rotating guard phase from a shared monotonic epoch, persists an owed flag when it belongs to that phase, refuses opportunistic admission adjacent to an owed neighbor, and attempts to acquire its two mutexes locally. This is coordinator-free shared-memory admission, not a network-distributed protocol: workers still observe a common time base and shared owed state. The corrected thread matrix above shows that this mechanism occupies different operating points depending on both critical-section payload and host platform. It is slower and less regular than GF--GRR on saturated sleep; for ledger/KV it is markedly faster on ARM64 but not on x86$_{64}$, while giving up p99 regularity and fairness on both.
+
+\subsection{Separate-process replication}
+To test whether the decentralized mechanism depends on one thread scheduler or one address space, we also implemented a separate fork-per-philosopher program using process-shared POSIX mutexes and semaphores. This process implementation is independent of the affected thread harness: its sleep path directly performs the bounded sampled sleep and does not contain the recursive payload branch. DGuard uses no parent scheduling loop after launch; each child derives guard membership locally from the monotonic epoch and communicates only through process-shared resource mutexes and owed flags. Resource ordering and the ordinary $N-1$ waiter serve as low-coordination baselines.
+
+The process matrix contains 78 completed runs over $N\in\{5,51,201\}$ with sleep and ledger payloads plus $N=501$ saturated stress cases. All ledger invariants passed. At saturated $N=201$ with sleep, process DGuard averaged 42,958 completions/s, 19.08 ms p99 wait, Jain 0.976, and zero unserved workers. At $N=501$, its single stress run reached 55,800/s but p99 rose to 64.76 ms, Jain fell to 0.706, and 28 workers received no measured service. The ledger payload shows the same scale sensitivity: DGuard Jain decreased from 0.964 at $N=201$ to 0.855 at $N=501$. Because the process study has only two seeds per core size and one $N=501$ stress replicate, it remains descriptive replication rather than primary inferential evidence.
+
+The process result is therefore used only to support a limited point: eliminating a central selector does not automatically preserve service regularity as contention and scale rise. It is not used to restore the superseded thread-level throughput claims.
+
+\section{Discussion}
+The simulator and corrected native experiments now support a more constrained and more defensible interpretation. In the synchronous model, GF--GRR retains most of Age-MWIS's utilization gain while preserving the formal GRR service guard. In native execution, the strongest replicated property is not universal throughput superiority but service regularity under sustained timing-dominated contention. At saturated $N=501$ sleep, GF--GRR produces almost identical p99 wait on x86$_{64}$ and ARM64 despite very different absolute throughput, and it serves every worker in each short measurement window. Age-MWIS trades that regularity for higher throughput, while the ordinary and strict-FIFO waiters collapse under this high-contention condition.
+
+Coordinator removal is more subtle than the superseded results implied. DGuard does not simply ``remove overhead'': with the corrected sleep payload it is slower than GF--GRR on both architectures; on ledger and KV it delivers substantially more throughput on ARM64 but no statistically resolved throughput benefit on x86$_{64}$. The likely explanation is not an architectural universal but a balance among selection overhead, critical-section cost, memory/arithmetic work, local mutex races, runnable contention, and host scheduling. By contrast, the p99 and fairness penalties of DGuard relative to GF--GRR on saturated ledger/KV reproduce on both platforms. The design question is therefore \emph{how much global coordination is worth paying for at a given contention pattern, payload, platform, and fairness target}, not whether centralization or decentralization is intrinsically superior.
+
+This is not evidence that GRR should replace classical lock protocols. Chandy--Misra, Lehmann--Rabin, resource ordering, fair queueing locks, and distributed/wait-free algorithms solve different problems under different timing, failure, locality, and communication assumptions \cite{lehmann1981,chandy1984,bendavid2025}. Central GF--GRR is best interpreted as an explicit conflict scheduler with a rotating service guard. DGuard shows that the priority idea can be decentralized in shared memory, but local arbitration then becomes part of the problem. A genuinely network-distributed guarded scheduler remains a separate design problem.
+
+That interpretation also connects the result to modern multi-agent systems. DPBench's observation that independent LLM agents can converge on identical resource-acquisition strategies and deadlock under simultaneous action \cite{hasan2026} suggests one possible application domain for external conflict-set schedulers. This paper does not test LLM agents directly, and no performance transfer is assumed.
+
+\section{Threats to Validity and Limitations}
+\textbf{Correction scope and superseded native data.} Two pre-submission audits changed the native evidence. The first fixed a recursive sleep-payload path and a central-drain payload mismatch. The second replaced request-arrival-cohort accounting with completion-window accounting and gave DGuard an epoch origin established before warmup. All thread-level native tables produced before these corrections are superseded and excluded from the final empirical argument. The synchronous simulator is unaffected. The independent process-isolated program is retained only as descriptive evidence and is not pooled with the final 960-run thread matrix.
+
+\textbf{Hardware replication is not controlled architecture benchmarking.} The final matrix runs natively on x86$_{64}$ and ARM64, but the GitHub-hosted Azure VMs differ in CPU implementation, cache/SMT topology, placement, and virtualization conditions. Absolute throughput differences must not be attributed to ISA. The meaningful cross-platform evidence is replication of qualitative scheduler behavior.
+
+\textbf{Finite measurement windows.} Each final native run measures 2.0 s. This is more than an order of magnitude longer than the superseded short-window study and removes the arrival-cohort/drain artifact, but it is still finite. A zero-service worker is a windowed diagnostic, not proof of starvation. In the final $N=501$ matrix GF--GRR, DGuard, Age-MWIS, and FIFO have zero zero-service workers in the headline saturated sleep conditions; the ordinary waiter still shows severe concentration.
+
+\textbf{Round bound versus wall-clock bound.} Proposition 4 applies to the synchronous round model. Variable service duration, preemption, mutex wake-up policy, and scheduler jitter prevent translating a two-round opportunity bound into a fixed millisecond real-time guarantee. Native claims concern measured tail regularity, not a new hard response-time theorem.
+
+\textbf{Workload model.} Demand remains closed-loop with at most one outstanding request per worker. Sleep is a bounded timing surrogate; ledger and KV are application-shaped microbenchmarks rather than production traces. Correlated external arrivals, unbounded heavy tails, I/O stalls, priorities, cancellation, failures, and transactional rollback remain untested.
+
+\textbf{DGuard is shared-memory decentralized, not network distributed.} Workers use a common monotonic time base and shared owed state. Message delay, clock skew, partial failure, partitions, and replicated state are absent. Chandy--Misra-style message-passing comparisons remain future work.
+
+\textbf{Waiter baselines.} The ordinary $N-1$ waiter inherits host POSIX semaphore/mutex wake-up behavior and has no fairness guarantee. The strict FIFO waiter intentionally stops at the oldest blocked request and can suffer severe head-of-line blocking. More sophisticated fair admission queues with bounded bypass may occupy better operating points.
+
+\textbf{Statistics.} The final native matrix uses eight paired seeds per architecture/payload/workload condition. Seeds align pseudorandom payload sequences, but OS scheduling remains nondeterministic. Exact paired Wilcoxon tests with Holm correction are therefore small-sample robustness checks, not substitutes for dedicated hardware replication. We report nonsignificant contrasts explicitly; for example, GF--GRR and Age-MWIS saturated sleep throughput are statistically indistinguishable on x86$_{64}$ under the stated family.
+
+\textbf{Novelty.} The fixed rotating schedule is prior art \cite{lee2023}. We did not identify the exact guarded-fill composition in the reviewed sources, but age-priority reservations and MWIS conflict scheduling are established concepts \cite{scholliers2014,paschalidis2015}. The contribution is the explicit guarded composition, its formal analysis, and a corrected reproducible characterization under the stated model---not a claim of a universal new DPP solution.
+
+\section{Reproducibility}
+The accompanying artifact contains the simulator source, raw per-run CSVs, aggregates, structural-verification outputs, selector microbenchmarks, statistical tables, plotting code, manuscript source, and the reproduction notebook. The final native package adds the semantically corrected C++17 source, separate x86$_{64}$ and ARM64 host metadata, ASan/UBSan smoke outputs, per-architecture 480-row CSVs, the combined 960-row dataset, grouped summaries, paired Wilcoxon/Holm tables, and the figures used in this revision.
+
+The source executed in the final native matrix is byte-identical across runner types with SHA-256 \texttt{62e91da4\allowbreak{}636dc597\allowbreak{}d43e64a6\allowbreak{}f9a81b5b\allowbreak{}c2429f27\allowbreak{}96e49783\allowbreak{}1047779c\allowbreak{}3476c336}. The final parallel GitHub Actions execution is run \texttt{35013398709}; the triggering workflow commit is \texttt{6b3ae395\allowbreak{}66005f63\allowbreak{}7e351857\allowbreak{}9dce1b9d\allowbreak{}d297975b}. Two native architecture-validation jobs reconstruct the source, require the exact SHA, and pass ASan/UBSan smoke tests. Twenty-four condition jobs then run the same source, one architecture--$N$--payload--workload condition per native VM, keeping all eight seeds and five policies together within each condition; each condition artifact is required to contain 40 data rows.
+
+Exactly 480 validated rows are required per architecture after merging the 12 condition artifacts, for 960 native rows total. The merged dataset is checked for the full Cartesian product of architectures, $N$, payloads, workloads, seeds, and policies, with a 2.0 s measurement window in every row. The executable checks the ledger conservation invariant after every ledger run. Earlier affected CSVs are retained only as audit history and are not evidence for any final native claim.
+
+Three additional checks guard the model-level implementation. GRR adjacency, cardinality, and cyclic opportunity gaps were verified for all $N=3,\ldots,500$ with zero failures. The Age-MWIS cycle dynamic program was compared with exhaustive enumeration on 1,500 random instances for $3\le N\le12$, with zero objective mismatches. Stress and canonical simulator experiments use separate configurations from the core aggregation.
+
+\section{Conclusion}
+The fixed rotating-group idea that motivated this study is not new: Lee's 2023 group round-robin construction already captures its core. Formalizing GRR as rotating maximum independent sets nevertheless makes its value precise. In the synchronous model it excludes resource conflicts at admission, attains $\lfloor N/2\rfloor$ saturated concurrency, and provides service opportunities every two rounds for even $N$ and with gaps of two or three for odd $N$.
+
+The simulator separates two responses to GRR's dynamic-utilization loss. Age-MWIS is the aggressive adaptive reference; GF--GRR is the guarded hybrid. Across the simulator's core conditions GF--GRR recovered 79.3--99.7\% of the Age-MWIS throughput improvement over GRR while retaining the formal guard. That establishes a model-level throughput--bound trade-off but says nothing by itself about operating-system scheduling cost.
+
+The final native study was frozen only after correcting both control-flow and measurement-semantics defects. Across 960 two-second runs on native x86$_{64}$ and ARM64, the strongest replicated GF--GRR property is tail regularity under sustained contention. On saturated sleep, GF--GRR has p99 waits near 17--18 ms on both platforms; DGuard is about 30--32\% slower and substantially higher-tailed. Age-MWIS is statistically indistinguishable from GF--GRR in x86$_{64}$ throughput and is 7.3\% faster on ARM64, but GF--GRR retains materially lower p99 and higher fairness on both.
+
+Coordinator removal is valuable only in some regimes. On ARM64 ledger/KV, DGuard raises saturated throughput by 48.5--55.2\% relative to GF--GRR, with statistically resolved increases in p99 wait and decreases in Jain fairness. On x86$_{64}$ ledger/KV, the DGuard/GF--GRR throughput contrasts are not significant, while the p99 and fairness penalties remain significant. Under bursty demand, low-coordination DGuard/waiter mechanisms are often fastest and fairness is high across policies. The resulting design space is therefore not ``centralized good'' or ``decentralized good.'' It is a workload- and platform-dependent frontier among useful work, global selection overhead, local contention, tail latency, and fairness.
+
+The separate process-isolated study remains descriptive evidence that the coordinator-free mechanism can be implemented outside one thread address space, but it is not pooled with the final thread matrix. A genuinely distributed guarded scheduler would need message passing, clock-skew tolerance, failure semantics, and replicated state. The next useful validation is therefore controlled bare-metal replication and then network-distributed coordination, not another claim of a universal Dining Philosophers solution.
+
+\balance
+\bibliographystyle{IEEEtran}
+\bibliography{Merged_Dining_Philosophers_References_Submission_Clean}
+\end{document}

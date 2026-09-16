@@ -1,0 +1,5 @@
+{
+  "N_checked": "3..500",
+  "failures": 0,
+  "maximum_observed_interservice_gap": 3
+}

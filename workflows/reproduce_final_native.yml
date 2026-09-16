@@ -1,0 +1,61 @@
+name: reproduce-final-native-evidence
+
+on:
+  workflow_dispatch:
+
+jobs:
+  validate-and-benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact final source
+        shell: bash
+        run: |
+          sha256sum native/final_native_threads.cpp
+          test "$(sha256sum native/final_native_threads.cpp | awk '{print $1}')" = \
+            "62e91da4636dc597d43e64a6f9a81b5bc2429f2796e497831047779c3476c336"
+
+      - name: ASan/UBSan smoke test
+        shell: bash
+        run: |
+          g++ -O0 -g -std=c++17 -pthread \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            native/final_native_threads.cpp -o native_san
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+            ./native_san gfgrr 5 saturated sleep 991 0.25 200 0 0 1200
+
+      - name: Optimized build
+        run: g++ -O3 -std=c++17 -pthread native/final_native_threads.cpp -o native_final
+
+      - name: Run full 480-row architecture matrix
+        shell: bash
+        run: |
+          OUT="results-${{ matrix.arch }}.csv"
+          echo 'policy,N,workload,app,seed,measure_s,tick_us,sched_jitter_us,dispatch_jitter_us,meals,throughput_s,mean_wait_ms,p50_wait_ms,p95_wait_ms,p99_wait_ms,max_wait_ms,jain,min_meals,max_meals,zero_workers,scheduler_ticks,guard_obligations,max_owed_age_ms' > "$OUT"
+          for N in 101 501; do
+            for app in sleep ledger kv; do
+              for wl in saturated bursty; do
+                for seed in 1 2 3 4 5 6 7 8; do
+                  for pol in gfgrr dguard fifo waiter agemwis; do
+                    timeout 45s ./native_final "$pol" "$N" "$wl" "$app" "$seed" \
+                      2.0 200 120 80 1200 | tail -n1 >> "$OUT"
+                  done
+                done
+              done
+            done
+          done
+          test "$(wc -l < "$OUT")" -eq 481
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-native-${{ matrix.arch }}
+          path: results-${{ matrix.arch }}.csv

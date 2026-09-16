@@ -1,0 +1,6 @@
+{
+  "cases": 1500,
+  "failures": 0,
+  "n_range": "3..12",
+  "objective": "lexicographic (max cardinality, then total waiting age)"
+}

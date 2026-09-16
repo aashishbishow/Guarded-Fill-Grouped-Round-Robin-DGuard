@@ -1,0 +1,31 @@
+{
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "python": "3.13.5",
+  "numpy": "2.3.5",
+  "pandas": "2.2.3",
+  "benchmark_elapsed_s": 26.676380548999987,
+  "rounds_measured": 3000,
+  "warmup_rounds": 300,
+  "replicates": 12,
+  "algorithms": [
+    "GRR",
+    "RotatingGreedy",
+    "AgeMIS",
+    "SingleWaiter",
+    "GuardedFill"
+  ],
+  "Ns": [
+    101,
+    1001
+  ],
+  "arrival_probabilities": [
+    0.05,
+    0.2,
+    0.4
+  ],
+  "workloads": [
+    "uniform",
+    "hotspot"
+  ],
+  "model": "synchronous rounds; one pending hunger request per philosopher; Bernoulli arrival opportunity each round when not pending; unit eating duration"
+}

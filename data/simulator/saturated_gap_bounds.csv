@@ -1,0 +1,7 @@
+N,capacity,grr_min_gap,grr_max_gap,grr_mean_gap,expected_even_or_odd
+5,2,2,3,2.48,odd
+6,3,2,2,2.0,even
+7,3,2,3,2.3214285714285716,odd
+10,5,2,2,2.0,even
+101,50,2,3,2.0199348793939795,odd
+1001,500,2,3,2.0019993348879273,odd
