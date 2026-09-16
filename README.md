@@ -5,7 +5,6 @@
 
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Paper](https://img.shields.io/badge/paper-IEEE%20Format-red.svg)](paper/paper.pdf)
 [![Reproducibility](https://img.shields.io/badge/reproducibility-verified-success.svg)](COMPLETE_SOURCE_MANIFEST.md)
 
 This repository contains the complete research source code, formal/model verifications, empirical datasets, and full reproducibility suite for the paper **"From Fixed Group Round-Robin to Guarded Adaptivity in the Dining Philosophers Problem"**.
